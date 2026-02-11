@@ -9,6 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/redis/go-redis/v9/auth"
 	"github.com/redis/go-redis/v9/internal"
 	"github.com/redis/go-redis/v9/internal/auth/streaming"
@@ -281,22 +284,31 @@ func (c *baseClient) getConn(ctx context.Context) (*pool.Conn, error) {
 }
 
 func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
+	span := trace.SpanFromContext(ctx)
+
+	span.AddEvent("pool.get")
 	cn, err := c.connPool.Get(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	if cn.IsInited() {
+		span.AddEvent("pool.get.done", trace.WithAttributes(attribute.Bool("pool.hit", true)))
 		return cn, nil
 	}
 
+	span.AddEvent("pool.get.done", trace.WithAttributes(attribute.Bool("pool.hit", false)))
+
+	span.AddEvent("conn.init")
 	if err := c.initConn(ctx, cn); err != nil {
+		span.AddEvent("conn.init.error")
 		c.connPool.Remove(ctx, cn, err)
 		if err := errors.Unwrap(err); err != nil {
 			return nil, err
 		}
 		return nil, err
 	}
+	span.AddEvent("conn.init.done")
 
 	// initConn will transition to IDLE state, so we need to acquire it
 	// before returning it to the user.
@@ -488,7 +500,10 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 
 	// for redis-server versions that do not support the HELLO command,
 	// RESP2 will continue to be used.
+	span := trace.SpanFromContext(ctx)
+	span.AddEvent("hello")
 	if initErr = conn.Hello(ctx, c.opt.Protocol, username, password, c.opt.ClientName).Err(); initErr == nil {
+		span.AddEvent("hello.done")
 		// Authentication successful with HELLO command
 	} else if !isRedisError(initErr) {
 		// When the server responds with the RESP protocol and the result is not a normal
@@ -513,6 +528,7 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		}
 	}
 
+	span.AddEvent("init.pipeline")
 	_, initErr = conn.Pipelined(ctx, func(pipe Pipeliner) error {
 		if c.opt.DB > 0 {
 			pipe.Select(ctx, c.opt.DB)
@@ -532,6 +548,7 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		cn.GetStateMachine().Transition(pool.StateClosed)
 		return fmt.Errorf("failed to initialize connection options: %w", initErr)
 	}
+	span.AddEvent("init.pipeline.done")
 
 	// Enable maintnotifications if maintnotifications are configured
 	c.optLock.RLock()
@@ -698,17 +715,22 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int) (bool
 
 	retryTimeout := uint32(0)
 	if err := c.withConn(ctx, func(ctx context.Context, cn *pool.Conn) error {
+		span := trace.SpanFromContext(ctx)
+
 		// Process any pending push notifications before executing the command
 		if err := c.processPushNotifications(ctx, cn); err != nil {
 			internal.Logger.Printf(ctx, "push: error processing pending notifications before command: %v", err)
 		}
 
+		span.AddEvent("cmd.write")
 		if err := cn.WithWriter(c.context(ctx), c.opt.WriteTimeout, func(wr *proto.Writer) error {
 			return writeCmd(wr, cmd)
 		}); err != nil {
 			atomic.StoreUint32(&retryTimeout, 1)
 			return err
 		}
+		span.AddEvent("cmd.write.done")
+
 		readReplyFunc := cmd.readReply
 		// Apply unstable RESP3 search module.
 		if c.opt.Protocol != 2 {
@@ -720,6 +742,7 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int) (bool
 				readReplyFunc = cmd.readRawReply
 			}
 		}
+		span.AddEvent("cmd.read")
 		if err := cn.WithReader(c.context(ctx), c.cmdTimeout(cmd), func(rd *proto.Reader) error {
 			// To be sure there are no buffered push notifications, we process them before reading the reply
 			if err := c.processPendingPushNotificationWithReader(ctx, cn, rd); err != nil {
@@ -734,6 +757,7 @@ func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int) (bool
 			}
 			return err
 		}
+		span.AddEvent("cmd.read.done")
 
 		return nil
 	}); err != nil {

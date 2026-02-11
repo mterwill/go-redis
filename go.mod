@@ -1,6 +1,6 @@
 module github.com/redis/go-redis/v9
 
-go 1.21
+go 1.24.0
 
 require (
 	github.com/bsm/ginkgo/v2 v2.12.0
@@ -15,7 +15,11 @@ require (
 	go.uber.org/atomic v1.11.0
 )
 
-require github.com/klauspost/cpuid/v2 v2.0.9 // indirect
+require (
+	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
+	go.opentelemetry.io/otel v1.40.0 // indirect
+	go.opentelemetry.io/otel/trace v1.40.0 // indirect
+)
 
 retract (
 	v9.15.1 // This version is used to retract v9.15.0
