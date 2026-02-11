@@ -8,6 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/redis/go-redis/v9/internal"
 	"github.com/redis/go-redis/v9/internal/proto"
 	"github.com/redis/go-redis/v9/internal/rand"
@@ -317,6 +320,8 @@ func (p *ConnPool) NewConn(ctx context.Context) (*Conn, error) {
 }
 
 func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
+	span := trace.SpanFromContext(ctx)
+
 	if p.closed() {
 		return nil, ErrClosed
 	}
@@ -333,10 +338,13 @@ func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
 
 	dialCtx, cancel := context.WithTimeout(ctx, p.cfg.DialTimeout)
 	defer cancel()
+	span.AddEvent("pool.dial")
 	cn, err := p.dialConn(dialCtx, pooled)
 	if err != nil {
+		span.AddEvent("pool.dial.error", trace.WithAttributes(attribute.String("error", err.Error())))
 		return nil, err
 	}
+	span.AddEvent("pool.dial.done")
 
 	// NOTE: Connection is in CREATED state and will be initialized by redis.go:initConn()
 	// when first used. Do NOT transition to IDLE here - that happens after initialization completes.
@@ -393,6 +401,8 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
 		backoffDuration = 100 * time.Millisecond // Default value
 	}
 
+	span := trace.SpanFromContext(ctx)
+
 	var lastErr error
 	shouldLoop := true
 	// when the timeout is reached, we should stop retrying
@@ -400,8 +410,13 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
 	// instead of a generic context deadline exceeded error
 	attempt := 0
 	for attempt = 0; (attempt < maxRetries) && shouldLoop; attempt++ {
+		span.AddEvent("pool.dial.attempt", trace.WithAttributes(attribute.Int("attempt", attempt)))
 		netConn, err := p.cfg.Dialer(ctx)
 		if err != nil {
+			span.AddEvent("pool.dial.attempt.error", trace.WithAttributes(
+				attribute.Int("attempt", attempt),
+				attribute.String("error", err.Error()),
+			))
 			lastErr = err
 			// Add backoff delay for retry attempts
 			// (not for the first attempt, do at least one)
@@ -413,6 +428,8 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
 			}
 			continue
 		}
+
+		span.AddEvent("pool.dial.attempt.done", trace.WithAttributes(attribute.Int("attempt", attempt)))
 
 		// Success - create connection
 		cn := NewConnWithBufferSize(netConn, p.cfg.ReadBufferSize, p.cfg.WriteBufferSize)
@@ -492,6 +509,7 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 
 // getConn returns a connection from the pool.
 func (p *ConnPool) getConn(ctx context.Context) (*Conn, error) {
+	span := trace.SpanFromContext(ctx)
 	var cn *Conn
 	var err error
 
@@ -499,9 +517,11 @@ func (p *ConnPool) getConn(ctx context.Context) (*Conn, error) {
 		return nil, ErrClosed
 	}
 
+	span.AddEvent("pool.wait_turn")
 	if err := p.waitTurn(ctx); err != nil {
 		return nil, err
 	}
+	span.AddEvent("pool.wait_turn.done")
 
 	// Use cached time for health checks (max 50ms staleness is acceptable)
 	nowNs := getCachedTimeNs()
@@ -575,6 +595,9 @@ func (p *ConnPool) getConn(ctx context.Context) (*Conn, error) {
 }
 
 func (p *ConnPool) queuedNewConn(ctx context.Context) (*Conn, error) {
+	span := trace.SpanFromContext(ctx)
+
+	span.AddEvent("pool.dial_semaphore")
 	select {
 	case p.dialsInProgress <- struct{}{}:
 		// Got permission, proceed to create connection
@@ -582,8 +605,13 @@ func (p *ConnPool) queuedNewConn(ctx context.Context) (*Conn, error) {
 		p.freeTurn()
 		return nil, ctx.Err()
 	}
+	span.AddEvent("pool.dial_semaphore.done")
 
-	dialCtx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
+	// Propagate the span into the dial context so events are parented correctly.
+	dialCtx, cancel := context.WithTimeout(
+		trace.ContextWithSpan(context.Background(), span),
+		p.cfg.DialTimeout,
+	)
 
 	w := &wantConn{
 		ctx:       dialCtx,
